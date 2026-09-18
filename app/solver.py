@@ -89,6 +89,20 @@ class ExcludedPairError(ValueError):
         super().__init__(f"excluded_pairs[{index}]: {message}")
 
 
+class ProposedGroupError(ValueError):
+    """A proposed group fails audit validation.
+
+    ``index`` is the group's 0-based index in ``proposed_groups`` and
+    ``code`` is a stable machine-readable error type used verbatim as the
+    FastAPI error ``type``.
+    """
+
+    def __init__(self, index: int, code: str, message: str) -> None:
+        self.index = index
+        self.code = code
+        super().__init__(f"proposed_groups[{index}]: {message}")
+
+
 def resolve_excluded_pairs(
     left_ids: set[str],
     right_ids: set[str],
@@ -170,6 +184,188 @@ def resolve_locked_groups(
             raise LockedGroupError(gi, "group violates shape/sign/amount/48h rules")
         resolved.append(cand)
     return resolved
+
+
+def resolve_proposed_groups(
+    rec: "Reconciler",
+    proposed: Sequence[LockedGroup],
+) -> tuple[list[Candidate | None], list[ProposedGroupError]]:
+    """Audit an externally supplied complete reconciliation plan.
+
+    Every group is checked independently -- one bad group never aborts the
+    checks for the others -- and at most one error per group is returned,
+    reporting its first violated rule in a fixed priority order.  The result
+    pair is ``(resolved, errors)``: ``resolved[i]`` is the legal candidate for
+    group ``i`` (or ``None`` when the group is illegal), and ``errors`` is
+    sorted by group index.
+
+    Per-group checks, in priority order:
+      1. a duplicated id inside one side of the group;
+      2. a reference to an id that does not exist on the referenced side
+         (an id from the opposite side is reported as a wrong-side reference);
+      3. reuse of a transaction that an earlier group (in array order) or a
+         locked group already uses;
+      4. containing both members of an operator-declared excluded pair;
+      5. the common legality rules: shape, common sign, equal side sums,
+         and the 48-hour timestamp span.
+
+    Cross-group reuse is attributed to the later group claiming the
+    transaction; a group with an earlier (per-group) error still claims its
+    correctly-referenced transactions, so downstream reuse stays visible.
+    """
+    left_txns = {t.id: t for t in rec.left}
+    right_txns = {t.id: t for t in rec.right}
+
+    # Transactions consumed by locked groups; a proposed group whose encoding
+    # is exactly one of the locked groups restates it (part of the complete
+    # plan) and is accepted instead of being reported as reuse.
+    locked_by_enc = {cand.encoding: cand for cand in rec.locked}
+    locked_ids: set[str] = set()
+    for cand in rec.locked:
+        locked_ids.update(cand.left_ids)
+        locked_ids.update(cand.right_ids)
+    # Ids already used by earlier proposed groups (in array order).
+    claimed: set[str] = set()
+    # Locked encodings already restated by an earlier proposed group.
+    restated: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+
+    resolved: list[Candidate | None] = []
+    errors: list[ProposedGroupError] = []
+    for gi, grp in enumerate(proposed):
+        lids = list(grp.left_ids)
+        rids = list(grp.right_ids)
+        ok = True
+
+        def fail(code: str, message: str) -> None:
+            nonlocal ok
+            ok = False
+            errors.append(ProposedGroupError(gi, code, message))
+
+        # 1. duplicated id inside one side of the group
+        if len(set(lids)) != len(lids) or len(set(rids)) != len(rids):
+            fail("proposed_group.duplicate_id", "duplicate transaction id inside group")
+        else:
+            # 2. references: opposite-side ids first, then truly unknown ids
+            wrong = next((i for i in lids if i in right_txns), None)
+            if wrong is not None:
+                fail(
+                    "proposed_group.wrong_side",
+                    f"left_ids entry {wrong!r} references a right-side transaction",
+                )
+            else:
+                wrong = next((i for i in rids if i in left_txns), None)
+                if wrong is not None:
+                    fail(
+                        "proposed_group.wrong_side",
+                        f"right_ids entry {wrong!r} references a left-side transaction",
+                    )
+                else:
+                    unknown = next((i for i in lids if i not in left_txns), None)
+                    if unknown is None:
+                        unknown = next((i for i in rids if i not in right_txns), None)
+                    if unknown is not None:
+                        fail(
+                            "proposed_group.unknown_id",
+                            f"unknown transaction id: {unknown}",
+                        )
+
+        # Correctly-referenced ids are claimed even when the group already has
+        # an error (e.g. a duplicate on the other side), keeping later reuse
+        # deterministic.
+        valid_lids = [i for i in lids if i in left_txns and i not in right_txns]
+        valid_rids = [i for i in rids if i in right_txns and i not in left_txns]
+
+        if ok:
+            # 3. cross-group mutual exclusion.  A group restating a locked
+            # group (same encoding) is that locked group, not reuse; every
+            # other overlap with a locked group or an earlier proposed group
+            # is blamed on this (later) group.  A locked group may be restated
+            # at most once.
+            enc = (tuple(sorted(valid_lids)), tuple(sorted(valid_rids)))
+            restating_locked = enc in locked_by_enc and enc not in restated
+            if not restating_locked:
+                used = locked_ids | claimed
+                reused = next((i for i in valid_lids + valid_rids if i in used), None)
+                if reused is not None:
+                    fail(
+                        "proposed_group.transaction_reused",
+                        f"transaction reused by another group: {reused}",
+                    )
+
+        if ok:
+            # 4. operator-declared excluded pair
+            excluded_hit = sorted(
+                (lid, rid)
+                for lid, rid in rec.excluded_pairs
+                if lid in set(valid_lids) and rid in set(valid_rids)
+            )
+            if excluded_hit:
+                lid, rid = excluded_hit[0]
+                fail(
+                    "proposed_group.excluded_pair",
+                    f"group contains an excluded pair: ({lid}, {rid})",
+                )
+
+        if ok:
+            # 5. shape
+            if (len(lids), len(rids)) not in GROUP_SHAPES:
+                fail(
+                    "proposed_group.bad_shape",
+                    f"illegal group shape: {len(lids)}-{len(rids)}",
+                )
+
+        if ok:
+            # common sign
+            amounts = [left_txns[i].amount for i in valid_lids]
+            amounts += [right_txns[i].amount for i in valid_rids]
+            if not (all(a > 0 for a in amounts) or all(a < 0 for a in amounts)):
+                fail(
+                    "proposed_group.mixed_sign",
+                    "group mixes positive and negative amounts",
+                )
+
+        if ok:
+            # equal side sums
+            sum_l = sum(left_txns[i].amount for i in valid_lids)
+            sum_r = sum(right_txns[i].amount for i in valid_rids)
+            if sum_l != sum_r:
+                fail(
+                    "proposed_group.amount_mismatch",
+                    f"side sums differ: left {sum_l} != right {sum_r}",
+                )
+
+        if ok:
+            # 48-hour span (inclusive)
+            times = [left_txns[i].ts for i in valid_lids]
+            times += [right_txns[i].ts for i in valid_rids]
+            if max(times) - min(times) > MAX_SPAN_SECONDS:
+                fail(
+                    "proposed_group.outside_48h",
+                    "group timestamps span more than 48 hours",
+                )
+
+        cand: Candidate | None = None
+        if ok:
+            cand = rec.by_encoding.get(enc)
+            if cand is None:  # pragma: no cover - defensive: checks 1-5 are exhaustive
+                fail(
+                    "proposed_group.illegal",
+                    "group violates shape/sign/amount/48h rules",
+                )
+
+        if cand is not None:
+            resolved.append(cand)
+            if restating_locked:
+                restated.add(enc)
+            else:
+                claimed.update(cand.left_ids)
+                claimed.update(cand.right_ids)
+        else:
+            resolved.append(None)
+            claimed.update(valid_lids)
+            claimed.update(valid_rids)
+
+    return resolved, errors
 
 
 class Reconciler:

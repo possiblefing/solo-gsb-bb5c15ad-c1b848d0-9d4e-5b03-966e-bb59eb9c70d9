@@ -231,6 +231,131 @@ curl -X POST http://localhost:8000/reconcile \
 - `total`：全批次跨日期的正负号总计；
 - 没有未匹配流水时 `days` 为空数组，`total` 各项为 0。
 
+### `POST /reconcile/audit`
+
+审计**外部给出的完整核销方案**。请求体复用 `POST /reconcile` 的全部批次字段
+（`left` / `right` / `locked_groups` / `excluded_pairs`，校验规则完全一致），
+并**额外必传** `proposed_groups`——待审计的完整方案，每组的结构与
+`locked_groups` 相同：
+
+```json
+{
+  "left":  [
+    { "id": "A", "time": "2026-09-17T00:00:00Z", "amount": 100 },
+    { "id": "B", "time": "2026-09-17T00:00:00Z", "amount": 50 }
+  ],
+  "right": [
+    { "id": "X", "time": "2026-09-17T00:00:00Z", "amount": 150 },
+    { "id": "Y", "time": "2026-09-17T00:00:00Z", "amount": 100 }
+  ],
+  "proposed_groups": [
+    { "left_ids": ["A", "B"], "right_ids": ["X"] }
+  ]
+}
+```
+
+**逐组校验规则。** 服务端对 `proposed_groups` **逐组独立**校验，按固定优先级
+检查下列规则，单组错误**不会中止**其余组的检查；每组最多报告其第一条违规，
+错误按下标稳定升序返回（HTTP **422**，`loc` 为
+`["body", "proposed_groups", <下标>]`）：
+
+1. 组内同一侧出现重复 ID（`proposed_group.duplicate_id`）；
+2. 引用不存在的 ID（`proposed_group.unknown_id`）；引用了对侧 ID 报侧别错误
+   （`proposed_group.wrong_side`）；
+3. 跨组互斥：该组使用了更早（下标更小）的组或 `locked_groups` 已占用的流水，
+   违规记在**后出现的组**上（`proposed_group.transaction_reused`）；
+4. 组内同时包含某个排除对的两侧 ID（`proposed_group.excluded_pair`）；
+5. 五种组形之一（`proposed_group.bad_shape`）、组内金额同号
+   （`proposed_group.mixed_sign`）、两侧金额之和相等
+   （`proposed_group.amount_mismatch`）、时间跨度 ≤ 48 小时
+   （`proposed_group.outside_48h`）。
+
+```json
+{
+  "detail": [
+    {
+      "type": "proposed_group.unknown_id",
+      "loc": ["body", "proposed_groups", 0],
+      "msg": "proposed_groups[0]: unknown transaction id: NOPE",
+      "input": { "left_ids": ["A"], "right_ids": ["NOPE"] }
+    },
+    {
+      "type": "proposed_group.bad_shape",
+      "loc": ["body", "proposed_groups", 2],
+      "msg": "proposed_groups[2]: illegal group shape: 2-2",
+      "input": { "left_ids": ["A", "B"], "right_ids": ["X", "Y"] }
+    }
+  ]
+}
+```
+
+方案中的组**原样复述**某个 `locked_groups`（编码完全相同）时视为该锁定组本身，
+不计为跨组复用（完整方案本就包含锁定组）；同一锁定组复述两次时，第二组按复用
+报错。批次级校验与 `/reconcile` 完全一致：批次内重复 ID 返回 **400**，
+`excluded_pairs` / `locked_groups` 自身非法返回 **422**（各自的 `loc`）。
+
+**方案合法时**，服务端在同一批次（含锁定组、排除对约束）上计算规范最优解
+（核销总额最大；并列时组编码排序列表字典序最小），并与方案比较：
+
+- `valid`：方案全部通过逐组校验（合法响应恒为 `true`，非法时整体返回 422）；
+- `optimal`：方案与规范最优解**完全一致**（组集合相同；组的提交顺序不影响）；
+- `suboptimal_reason`：合法但非最优的原因——
+  - `"amount"`：**金额次优**，`proposed_total < optimal_total`；
+  - `"lexicographic"`：**金额相同但未命中字典序规范解**；
+  - 最优时为 `null`；
+- `proposed_total` / `optimal_total`：方案与规范最优解各自的核销金额绝对值
+  之和（分；规范解包含全部锁定组）；
+- `groups`：**规范最优解的核销组**（按组编码升序），供调用方直接据此修正方案。
+
+方案合法且命中最优时的响应：
+
+```json
+{
+  "valid": true,
+  "optimal": true,
+  "suboptimal_reason": null,
+  "proposed_total": 150,
+  "optimal_total": 150,
+  "groups": [
+    { "left_ids": ["A", "B"], "right_ids": ["X"], "amount": 150 }
+  ]
+}
+```
+
+金额次优示例（方案只核销 100，规范最优为 150）：
+
+```json
+{
+  "valid": true,
+  "optimal": false,
+  "suboptimal_reason": "amount",
+  "proposed_total": 100,
+  "optimal_total": 150,
+  "groups": [
+    { "left_ids": ["A", "B"], "right_ids": ["X"], "amount": 150 }
+  ]
+}
+```
+
+金额相同但未命中字典序规范解示例（两种配对都核销 200，
+`(A,X)+(B,Y)` 字典序更小）：
+
+```json
+{
+  "valid": true,
+  "optimal": false,
+  "suboptimal_reason": "lexicographic",
+  "proposed_total": 200,
+  "optimal_total": 200,
+  "groups": [
+    { "left_ids": ["A"], "right_ids": ["X"], "amount": 100 },
+    { "left_ids": ["B"], "right_ids": ["Y"], "amount": 100 }
+  ]
+}
+```
+
+该接口不参与 `Idempotency-Key` 幂等重放。
+
 ## 算法
 
 1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；
@@ -256,13 +381,15 @@ pytest
 ```
 
 包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
-`excluded_pairs` 以及二者组合的场景）。
+`excluded_pairs` 以及二者组合的场景），以及 `/reconcile/audit` 的逐组错误、
+金额次优与字典序次优场景测试。
 
 ## 项目结构
 
 ```
 app/
-  main.py         # FastAPI 入口与 /reconcile、/reconcile/unmatched-summary 端点
+  main.py         # FastAPI 入口与 /reconcile、/reconcile/audit、
+                  # /reconcile/unmatched-summary 端点
   models.py       # 请求/响应模型与校验
   solver.py       # 候选生成 + 最优互斥集求解
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化

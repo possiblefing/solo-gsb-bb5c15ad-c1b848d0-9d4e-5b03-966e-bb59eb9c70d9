@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
@@ -80,6 +81,20 @@ class ReconcileRequest(BaseModel):
     )
 
 
+class AuditRequest(ReconcileRequest):
+    """Batch fields identical to ``ReconcileRequest`` plus an external plan.
+
+    ``proposed_groups`` is the complete reconciliation plan to be audited;
+    every group uses the same shape as ``locked_groups``.  Semantic
+    validation (unknown ids, reuse, excluded pairs, group legality) runs per
+    group and returns 422 with one error entry per offending group index.
+    """
+
+    proposed_groups: list[LockedGroupIn] = Field(
+        description="The externally proposed complete reconciliation plan.",
+    )
+
+
 class GroupOut(BaseModel):
     """One reconciliation group: sorted id lists of both sides."""
 
@@ -93,6 +108,32 @@ class ReconcileResponse(BaseModel):
     total_amount: int  # sum of absolute reconciled amounts across groups
     unmatched_left_ids: list[str]
     unmatched_right_ids: list[str]
+
+
+SuboptimalReason = Literal["amount", "lexicographic"]
+
+
+class AuditResponse(BaseModel):
+    """Outcome of auditing an external complete reconciliation plan.
+
+    - ``valid``: every proposed group passed all checks;
+    - ``optimal``: the valid plan equals the canonical optimum (maximum total
+      amount, then the lexicographically smallest sorted group-encoding list);
+    - ``suboptimal_reason``: why a valid plan is not canonical -- ``"amount"``
+      for a smaller reconciled total, ``"lexicographic"`` when the totals tie
+      but another encoding list is the canonical tie-break winner;
+    - ``proposed_total`` / ``optimal_total``: sums of absolute group amounts
+      for the proposed plan and the canonical solution (locked groups included);
+    - ``groups``: the canonical solution groups (sorted by group encoding) so
+      the caller can correct a non-optimal plan.
+    """
+
+    valid: bool
+    optimal: bool
+    suboptimal_reason: SuboptimalReason | None = None
+    proposed_total: int
+    optimal_total: int
+    groups: list[GroupOut]
 
 
 class UnmatchedSummaryRequest(ReconcileRequest):

@@ -14,6 +14,8 @@ from fastapi.responses import Response
 
 from .idempotency import FingerprintConflict, canonical_fingerprint, store
 from .models import (
+    AuditRequest,
+    AuditResponse,
     DaySummary,
     GroupOut,
     ReconcileRequest,
@@ -31,6 +33,7 @@ from .solver import (
     Txn,
     resolve_excluded_pairs,
     resolve_locked_groups,
+    resolve_proposed_groups,
 )
 
 IDEMPOTENCY_KEY_MIN = 1
@@ -56,8 +59,14 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def solve(payload: ReconcileRequest) -> ReconcileResponse:
-    """Validate the batch and compute the reconciliation result."""
+def prepare_batch(payload: ReconcileRequest) -> tuple[Reconciler, list]:
+    """Validate batch-level fields and build the reconciler with locked groups.
+
+    Shared by ``/reconcile``, ``/reconcile/unmatched-summary`` and
+    ``/reconcile/audit`` so the three endpoints share identical 400/422
+    behaviour for duplicate ids, excluded pairs and locked groups.  Returns
+    the reconciler (with locked groups resolved) and the locked candidates.
+    """
     ids = [t.id for t in payload.left] + [t.id for t in payload.right]
     if len(set(ids)) != len(ids):
         raise HTTPException(status_code=400, detail="duplicate transaction id in batch")
@@ -109,7 +118,15 @@ def solve(payload: ReconcileRequest) -> ReconcileResponse:
                 ]
             )
 
-    groups = reconciler.solve(locked_cands)
+    reconciler.locked = locked_cands
+    return reconciler, locked_cands
+
+
+def solve(payload: ReconcileRequest) -> ReconcileResponse:
+    """Validate the batch and compute the reconciliation result."""
+    reconciler, _ = prepare_batch(payload)
+
+    groups = reconciler.solve()
     groups.sort(key=lambda c: c.encoding)
 
     matched_left = {i for c in groups for i in c.left_ids}
@@ -213,4 +230,72 @@ def unmatched_summary(payload: UnmatchedSummaryRequest) -> UnmatchedSummaryRespo
             for day, b in sorted(per_day.items())
         ],
         total=total,
+    )
+
+
+@app.post("/reconcile/audit", response_model=AuditResponse)
+def audit(payload: AuditRequest) -> AuditResponse:
+    """Audit an externally supplied complete reconciliation plan.
+
+    The batch fields (``left`` / ``right`` / ``locked_groups`` /
+    ``excluded_pairs``) are validated exactly as for ``POST /reconcile``.
+    Every group in ``proposed_groups`` is then checked independently against
+    the reference, shape, common-sign, equal-sum, 48-hour, excluded-pair and
+    cross-group mutual-exclusion rules; one bad group never aborts the checks
+    for the others, and errors are returned stably keyed by the group's
+    0-based index (HTTP 422).
+
+    When the whole plan is legal, the canonical optimum (maximum total
+    absolute amount, then lexicographically smallest sorted group-encoding
+    list) is computed and compared with the proposal: a strictly smaller
+    total is reported as ``"amount"`` sub-optimality, while equal totals with
+    a different encoding list are reported as ``"lexicographic"``.  The
+    canonical ``groups`` are always returned so the caller can correct the
+    plan.  This endpoint does not participate in ``Idempotency-Key`` replay.
+    """
+    reconciler, locked_cands = prepare_batch(payload)
+
+    proposed_in = [
+        LockedGroup(left_ids=tuple(g.left_ids), right_ids=tuple(g.right_ids))
+        for g in payload.proposed_groups
+    ]
+    resolved, errors = resolve_proposed_groups(reconciler, proposed_in)
+    if errors:
+        raise RequestValidationError(
+            [
+                {
+                    "type": err.code,
+                    "loc": ["body", "proposed_groups", err.index],
+                    "msg": str(err),
+                    "input": payload.proposed_groups[err.index].model_dump(),
+                }
+                for err in errors
+            ]
+        )
+
+    proposed_cands = [c for c in resolved if c is not None]
+    canonical = sorted(reconciler.solve(), key=lambda c: c.encoding)
+
+    proposed_total = sum(c.weight for c in proposed_cands)
+    optimal_total = sum(c.weight for c in canonical)
+    proposed_encoding = sorted(c.encoding for c in proposed_cands)
+    canonical_encoding = [c.encoding for c in canonical]
+
+    if proposed_encoding == canonical_encoding:
+        optimal = True
+        reason = None
+    else:
+        optimal = False
+        reason = "amount" if proposed_total < optimal_total else "lexicographic"
+
+    return AuditResponse(
+        valid=True,
+        optimal=optimal,
+        suboptimal_reason=reason,
+        proposed_total=proposed_total,
+        optimal_total=optimal_total,
+        groups=[
+            GroupOut(left_ids=list(c.left_ids), right_ids=list(c.right_ids), amount=c.amount)
+            for c in canonical
+        ],
     )
