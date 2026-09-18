@@ -89,6 +89,19 @@ class ExcludedPairError(ValueError):
         super().__init__(f"excluded_pairs[{index}]: {message}")
 
 
+class ProposedGroupError(ValueError):
+    """A proposed group fails an audit check.
+
+    ``index`` is the group's 0-based list index and ``code`` a
+    machine-readable identifier of the failed check.
+    """
+
+    def __init__(self, index: int, code: str, message: str) -> None:
+        self.index = index
+        self.code = code
+        super().__init__(f"proposed_groups[{index}]: {message}")
+
+
 def resolve_excluded_pairs(
     left_ids: set[str],
     right_ids: set[str],
@@ -170,6 +183,94 @@ def resolve_locked_groups(
             raise LockedGroupError(gi, "group violates shape/sign/amount/48h rules")
         resolved.append(cand)
     return resolved
+
+
+def _legality_failure(
+    rec: "Reconciler", lids: list[str], rids: list[str]
+) -> tuple[str, str] | None:
+    """First legality failure of a fully resolved group as ``(code, message)``.
+
+    Checks, in the order the rules are documented: shape, same sign, equal
+    side sums, 48-hour span.  Returns ``None`` when the group is legal.
+    """
+    if (len(lids), len(rids)) not in GROUP_SHAPES:
+        return (
+            "shape",
+            f"unsupported group shape: {len(lids)}-{len(rids)} "
+            "(legal shapes: 1-1, 1-2, 1-3, 2-1, 3-1)",
+        )
+    txns = [rec.left[rec.left_index[i]] for i in lids]
+    txns += [rec.right[rec.right_index[i]] for i in rids]
+    amounts = [t.amount for t in txns]
+    if not (all(a > 0 for a in amounts) or all(a < 0 for a in amounts)):
+        return ("sign", "amounts inside the group do not share the same sign")
+    sum_l = sum(t.amount for t in txns[: len(lids)])
+    sum_r = sum(t.amount for t in txns[len(lids) :])
+    if sum_l != sum_r:
+        return ("sum_mismatch", f"side sums differ: left {sum_l} != right {sum_r}")
+    if max(t.ts for t in txns) - min(t.ts for t in txns) > MAX_SPAN_SECONDS:
+        return ("span", "group spans more than 48 hours")
+    return None
+
+
+def audit_proposed_groups(
+    rec: "Reconciler",
+    proposed: Sequence[LockedGroup],
+) -> list[ProposedGroupError]:
+    """Validate every proposed group and collect all failures.
+
+    Runs the same checks as :func:`resolve_locked_groups` -- duplicated ids
+    inside a group, unknown references, reuse across groups, operator-declared
+    excluded pairs and the common legality rules (shape / sign / equal sums /
+    48h) -- but does not stop at the first failure: each group's first failing
+    check is recorded and validation continues with the next group, so the
+    returned errors carry stable 0-based proposed-group indices in ascending
+    order.  Ids referenced by any group -- valid or not -- count towards
+    cross-group reuse.
+    """
+    left_ids = {t.id for t in rec.left}
+    right_ids = {t.id for t in rec.right}
+    errors: list[ProposedGroupError] = []
+    seen: set[str] = set()
+    for gi, grp in enumerate(proposed):
+        lids = list(grp.left_ids)
+        rids = list(grp.right_ids)
+        failure: tuple[str, str] | None = None
+        if len(set(lids)) != len(lids) or len(set(rids)) != len(rids):
+            failure = ("duplicate_id", "duplicate transaction id inside group")
+        else:
+            unknown = [i for i in lids if i not in left_ids]
+            unknown += [i for i in rids if i not in right_ids]
+            if unknown:
+                failure = ("unknown_id", f"unknown transaction id: {sorted(set(unknown))[0]}")
+            else:
+                reused = sorted({i for i in lids + rids if i in seen})
+                if reused:
+                    failure = (
+                        "reused",
+                        f"transaction reused by another proposed group: {reused[0]}",
+                    )
+                else:
+                    excluded_hit = sorted(
+                        (lid, rid)
+                        for lid, rid in rec.excluded_pairs
+                        if lid in lids and rid in rids
+                    )
+                    if excluded_hit:
+                        lid, rid = excluded_hit[0]
+                        failure = (
+                            "excluded_pair",
+                            f"group contains an excluded pair: ({lid}, {rid})",
+                        )
+                    else:
+                        failure = _legality_failure(rec, lids, rids)
+        # Every referenced id counts towards cross-group reuse, even when the
+        # group itself already failed an earlier check.
+        seen.update(lids)
+        seen.update(rids)
+        if failure is not None:
+            errors.append(ProposedGroupError(gi, *failure))
+    return errors
 
 
 class Reconciler:

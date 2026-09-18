@@ -14,6 +14,10 @@ from fastapi.responses import Response
 
 from .idempotency import FingerprintConflict, canonical_fingerprint, store
 from .models import (
+    AuditError,
+    AuditRequest,
+    AuditResponse,
+    BatchRequest,
     DaySummary,
     GroupOut,
     ReconcileRequest,
@@ -29,6 +33,7 @@ from .solver import (
     LockedGroupError,
     Reconciler,
     Txn,
+    audit_proposed_groups,
     resolve_excluded_pairs,
     resolve_locked_groups,
 )
@@ -56,8 +61,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def solve(payload: ReconcileRequest) -> ReconcileResponse:
-    """Validate the batch and compute the reconciliation result."""
+def build_reconciler(payload: BatchRequest) -> Reconciler:
+    """Validate the batch-level fields and build the reconciler.
+
+    Shared by every endpoint: duplicate transaction ids across the merged
+    sides are rejected with 400 and invalid excluded pairs with 422.
+    """
     ids = [t.id for t in payload.left] + [t.id for t in payload.right]
     if len(set(ids)) != len(ids):
         raise HTTPException(status_code=400, detail="duplicate transaction id in batch")
@@ -86,8 +95,12 @@ def solve(payload: ReconcileRequest) -> ReconcileResponse:
                     }
                 ]
             )
+    return Reconciler(left, right, excluded_pairs=excluded)
 
-    reconciler = Reconciler(left, right, excluded_pairs=excluded)
+
+def solve(payload: ReconcileRequest) -> ReconcileResponse:
+    """Validate the batch and compute the reconciliation result."""
+    reconciler = build_reconciler(payload)
 
     locked_cands = []
     if payload.locked_groups:
@@ -213,4 +226,69 @@ def unmatched_summary(payload: UnmatchedSummaryRequest) -> UnmatchedSummaryRespo
             for day, b in sorted(per_day.items())
         ],
         total=total,
+    )
+
+
+@app.post("/reconcile/audit", response_model=AuditResponse)
+def reconcile_audit(payload: AuditRequest) -> AuditResponse:
+    """Audit an externally proposed complete reconciliation plan.
+
+    The batch fields are validated exactly as in ``POST /reconcile`` (same
+    400/422 behaviour).  Every proposed group is then checked against the
+    usual rules -- references, duplicated ids, cross-group mutual exclusion,
+    excluded pairs, shape, same sign, equal sums and the 48-hour span --
+    collecting *all* failures keyed by the group's 0-based ``proposed_groups``
+    index instead of aborting at the first one.
+
+    A fully legal plan is compared against the canonical optimal solution of
+    the batch: ``optimal`` tells whether it matches, ``difference``
+    distinguishes an amount-suboptimal plan from one that reaches the optimal
+    total but misses the lexicographically canonical grouping, and ``groups``
+    carries the canonical solution for correction.  This endpoint is
+    read-only and does not take part in ``Idempotency-Key`` replay.
+    """
+    reconciler = build_reconciler(payload)
+
+    proposed = [
+        LockedGroup(left_ids=tuple(g.left_ids), right_ids=tuple(g.right_ids))
+        for g in payload.proposed_groups
+    ]
+    failures = audit_proposed_groups(reconciler, proposed)
+    if failures:
+        return AuditResponse(
+            valid=False,
+            errors=[AuditError(index=f.index, code=f.code, msg=str(f)) for f in failures],
+            optimal=None,
+            proposed_total=None,
+            optimal_total=None,
+            difference=None,
+            groups=None,
+        )
+
+    canonical = reconciler.solve([])
+    optimal_total = sum(c.weight for c in canonical)
+    proposed_encodings = sorted(
+        (tuple(sorted(g.left_ids)), tuple(sorted(g.right_ids))) for g in proposed
+    )
+    proposed_total = sum(reconciler.by_encoding[enc].weight for enc in proposed_encodings)
+    optimal = proposed_encodings == [c.encoding for c in canonical]
+    if optimal:
+        difference = None
+    elif proposed_total < optimal_total:
+        difference = "suboptimal_amount"
+    else:
+        # A valid plan is a feasible packing, so its total can never exceed
+        # the optimum; equal totals imply a non-canonical tie.
+        difference = "non_canonical"
+    return AuditResponse(
+        valid=True,
+        errors=[],
+        optimal=optimal,
+        proposed_total=proposed_total,
+        optimal_total=optimal_total,
+        difference=difference,
+        groups=[
+            GroupOut(left_ids=list(c.left_ids), right_ids=list(c.right_ids), amount=c.amount)
+            for c in canonical
+        ],
     )

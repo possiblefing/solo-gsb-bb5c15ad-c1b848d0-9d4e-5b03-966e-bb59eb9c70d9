@@ -231,6 +231,85 @@ curl -X POST http://localhost:8000/reconcile \
 - `total`：全批次跨日期的正负号总计；
 - 没有未匹配流水时 `days` 为空数组，`total` 各项为 0。
 
+### `POST /reconcile/audit`
+
+审计外部给出的**完整核销方案**。请求体复用批次字段（`left` / `right` / `excluded_pairs`，
+校验规则与 `POST /reconcile` 完全一致：重复 ID 返回 **400**，非法 `excluded_pairs` 返回
+**422**），并额外要求 `proposed_groups`——待审计的核销方案，每组形如
+`{"left_ids": [...], "right_ids": [...]}`（每侧 1～3 个 ID；缺字段、空侧、超 3 个、
+非字符串 ID 等 schema 错误返回 **422**）。
+
+**请求体**
+
+```json
+{
+  "left":  [{ "id": "A", "time": "2026-09-17T00:00:00Z", "amount": 100 },
+            { "id": "B", "time": "2026-09-17T00:00:00Z", "amount": 50 }],
+  "right": [{ "id": "X", "time": "2026-09-17T01:00:00Z", "amount": 150 },
+            { "id": "Y", "time": "2026-09-17T02:00:00Z", "amount": 100 }],
+  "proposed_groups": [
+    { "left_ids": ["A"], "right_ids": ["Y"] }
+  ]
+}
+```
+
+**逐组校验（不中断）**
+
+服务端按现有规则逐组校验每个 proposed group：引用（ID 必须存在于对应侧）、组内无重复
+ID、跨组互斥（同一笔流水不得进入多组，**非法组引用的 ID 同样计入占用**）、排除对、
+组形、同号、等额、48 小时。与 `locked_groups` 报首个错误即 422 不同，审计**不会因
+单组错误中止其余检查**：所有失败按 `proposed_groups` 下标稳定升序收入 `errors`
+（每组报告其首个失败项），响应仍为 **200**，此时 `valid` 为 `false`，其余审计字段
+为 `null`：
+
+```json
+{
+  "valid": false,
+  "errors": [
+    { "index": 0, "code": "sum_mismatch", "msg": "proposed_groups[0]: side sums differ: left 100 != right 101" },
+    { "index": 2, "code": "reused", "msg": "proposed_groups[2]: transaction reused by another proposed group: A" }
+  ],
+  "optimal": null,
+  "proposed_total": null,
+  "optimal_total": null,
+  "difference": null,
+  "groups": null
+}
+```
+
+`code` 取值：`unknown_id`（未知引用）/ `duplicate_id`（组内重复 ID）/ `reused`
+（跨组重复使用）/ `excluded_pair`（命中排除对）/ `shape`（组形非法）/ `sign`
+（组内异号）/ `sum_mismatch`（两侧不等额）/ `span`（跨度超 48 小时）。
+
+**合法方案的审计结果**
+
+方案全部组合法时，服务端计算该批次的规范最优解（与 `POST /reconcile` 相同的
+“核销金额绝对值总和最大 + 组编码列表字典序最小”规则，含 `excluded_pairs` 约束）并返回：
+
+```json
+{
+  "valid": true,
+  "errors": [],
+  "optimal": false,
+  "proposed_total": 100,
+  "optimal_total": 150,
+  "difference": "suboptimal_amount",
+  "groups": [
+    { "left_ids": ["A", "B"], "right_ids": ["X"], "amount": 150 }
+  ]
+}
+```
+
+- `proposed_total` / `optimal_total`：待审方案与规范最优解的核销金额绝对值总和（分）；
+- `optimal`：待审方案与规范最优解的组集合完全一致时为 `true`；
+- `difference`（仅 `optimal` 为 `false` 时有值）：
+  - `"suboptimal_amount"` —— **金额次优**：`proposed_total < optimal_total`；
+  - `"non_canonical"` —— **金额相同但未命中字典序规范解**：总额已达最优，但分组
+    方式不是字典序最小的规范解；
+- `groups`：规范最优解（按组编码升序），供修正方案时对照。
+
+该接口为只读审计，不参与 `Idempotency-Key` 幂等重放。
+
 ## 算法
 
 1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；
@@ -255,14 +334,14 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
-`excluded_pairs` 以及二者组合的场景）。
+包含 API 行为测试（含 `/reconcile/audit` 审计接口）与求解器对暴力枚举的随机差分测试
+（含带 `locked_groups`、`excluded_pairs` 以及二者组合的场景）。
 
 ## 项目结构
 
 ```
 app/
-  main.py         # FastAPI 入口与 /reconcile、/reconcile/unmatched-summary 端点
+  main.py         # FastAPI 入口与 /reconcile、/reconcile/unmatched-summary、/reconcile/audit 端点
   models.py       # 请求/响应模型与校验
   solver.py       # 候选生成 + 最优互斥集求解
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
@@ -62,21 +63,26 @@ class ExcludedPairIn(BaseModel):
     right_id: StrictStr = Field(min_length=1, max_length=128)
 
 
-class ReconcileRequest(BaseModel):
+class BatchRequest(BaseModel):
     """Batch of fund flows from two sides (at most 12 each)."""
 
     left: list[TransactionIn] = Field(default_factory=list, max_length=MAX_TRANSACTIONS_PER_SIDE)
     right: list[TransactionIn] = Field(default_factory=list, max_length=MAX_TRANSACTIONS_PER_SIDE)
-    locked_groups: list[LockedGroupIn] | None = Field(
-        default=None,
-        description="Optional operator-confirmed groups forced into the solution.",
-    )
     excluded_pairs: list[ExcludedPairIn] | None = Field(
         default=None,
         description=(
             "Optional (left_id, right_id) pairs that must never end up in the "
             "same reconciliation group."
         ),
+    )
+
+
+class ReconcileRequest(BatchRequest):
+    """Reconcile batch, optionally carrying operator constraints."""
+
+    locked_groups: list[LockedGroupIn] | None = Field(
+        default=None,
+        description="Optional operator-confirmed groups forced into the solution.",
     )
 
 
@@ -139,3 +145,62 @@ class UnmatchedSummaryResponse(BaseModel):
     timezone: str  # validated IANA key the local dates were computed with
     days: list[DaySummary]  # ascending by local date; only days with unmatched flows
     total: SignBreakdown  # whole-batch totals across all days
+
+
+class ProposedGroupIn(LockedGroupIn):
+    """One group of the externally proposed reconciliation plan under audit.
+
+    Same shape constraints as a locked group (1-3 ids per side).  Semantic
+    validation (references, reuse across groups, excluded pairs, legality) is
+    reported in the audit response keyed by the group's 0-based index.
+    """
+
+
+class AuditRequest(BatchRequest):
+    """Batch plus an externally proposed complete reconciliation plan.
+
+    The batch fields and their validation are identical to
+    ``ReconcileRequest`` (duplicate ids -> 400, invalid ``excluded_pairs`` ->
+    422); ``proposed_groups`` is the plan under audit and is checked group by
+    group, with every failure collected in the response instead of aborting
+    at the first one.
+    """
+
+    proposed_groups: list[ProposedGroupIn] = Field(
+        description="The complete reconciliation plan to audit (may be empty).",
+    )
+
+
+# Machine-readable identifiers of the per-group audit checks.
+AuditErrorCode = Literal[
+    "unknown_id",      # references a transaction id absent from the batch
+    "duplicate_id",    # same id twice inside one group
+    "reused",          # transaction already claimed by an earlier proposed group
+    "excluded_pair",   # group contains an operator-declared excluded pair
+    "shape",           # not one of the five legal group shapes
+    "sign",            # amounts inside the group do not share one sign
+    "sum_mismatch",    # left and right side sums differ
+    "span",            # group spans more than 48 hours
+]
+
+
+class AuditError(BaseModel):
+    """One proposed-group validation failure."""
+
+    index: int  # 0-based index into proposed_groups
+    code: AuditErrorCode
+    msg: str  # human-readable detail, prefixed with the group's index
+
+
+class AuditResponse(BaseModel):
+    valid: bool  # every proposed group passed every check
+    errors: list[AuditError]  # empty when valid; ascending by group index
+    # The fields below are only computed for a fully legal plan (null otherwise).
+    optimal: bool | None  # proposed plan == canonical optimal solution
+    proposed_total: int | None  # sum of absolute reconciled amounts of the plan
+    optimal_total: int | None  # total of the canonical optimal solution
+    # Why a valid plan is not optimal: "suboptimal_amount" (proposed_total <
+    # optimal_total) or "non_canonical" (same total, but not the
+    # lexicographically canonical grouping); null when optimal or invalid.
+    difference: Literal["suboptimal_amount", "non_canonical"] | None
+    groups: list[GroupOut] | None  # canonical optimal groups, for correction
